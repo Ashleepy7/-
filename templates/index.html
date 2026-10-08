@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>灵犀相册 · 照片主题智能分类</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📚</text></svg>">
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+<div class="app">
+
+  <!-- ---------------- 顶栏 ---------------- -->
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">📚</span>
+      <div>
+        <h1>灵犀相册</h1>
+        <p>照片主题自动分类 · 只读原图不改动</p>
+      </div>
+    </div>
+
+    <div class="searchwrap">
+      <div class="segmented modeseg" id="modeSeg">
+        <button data-mode="kw" class="on">🔤 关键词</button>
+        <button data-mode="ai" title="用大白话描述时间和内容；启用 AI 模型则由模型理解，否则走本地规则">✨ AI 查找</button>
+      </div>
+      <div class="search" id="searchBox">
+        <span id="searchIcon">🔍</span>
+        <input id="searchInput" type="search" placeholder="搜索文件名、文件夹或主题…" autocomplete="off">
+        <kbd id="searchKbd">/</kbd>
+        <button class="btn mini primary" id="btnAiGo" hidden>查找</button>
+      </div>
+    </div>
+
+    <div class="topbar-actions">
+      <button class="btn ghost" id="btnReclassify" title="重新分析全部照片">♻️ 重新分类</button>
+      <button class="btn ghost" id="btnLlm" title="AI 理解设置（云端或本地模型）">🧠 AI 设置</button>
+      <button class="btn primary" id="btnImport">＋ 导入照片</button>
+    </div>
+  </header>
+
+  <!-- ---------------- 任务进度条 ---------------- -->
+  <div class="jobbar" id="jobbar" hidden>
+    <div class="jobbar-inner">
+      <span id="jobText">准备中…</span>
+      <div class="jobtrack"><i id="jobFill"></i></div>
+      <span id="jobPct">0%</span>
+      <button class="btn mini" id="btnCancelJob">停止</button>
+    </div>
+  </div>
+
+  <!-- ---------------- 侧栏 ---------------- -->
+  <aside class="sidebar">
+    <section class="side-block">
+      <h2 class="side-title">主题分类</h2>
+      <ul class="theme-list" id="themeList"></ul>
+    </section>
+
+    <section class="side-block" id="monthBlock">
+      <h2 class="side-title">按月份</h2>
+      <ul class="mini-list" id="monthList"></ul>
+    </section>
+
+    <section class="side-block" id="folderBlock">
+      <h2 class="side-title">按文件夹</h2>
+      <ul class="mini-list" id="folderList"></ul>
+    </section>
+
+    <section class="side-block roots">
+      <h2 class="side-title">已导入的目录</h2>
+      <ul class="mini-list" id="rootList"></ul>
+    </section>
+
+    <section class="side-block footer">
+      <div class="stat-row"><span>照片总数</span><b id="statTotal">0</b></div>
+      <div class="stat-row"><span>已归类</span><b id="statOrg">0</b></div>
+      <div class="stat-row"><span>占用</span><b id="statBytes">0 MB</b></div>
+      <p class="tip">分类结果只写入本软件的数据库，<br>不会移动或修改任何原图。</p>
+    </section>
+  </aside>
+
+  <!-- ---------------- 主区域 ---------------- -->
+  <main class="content">
+    <div class="toolbar">
+      <div class="crumb">
+        <span class="crumb-emoji" id="crumbEmoji">🗂️</span>
+        <h2 id="crumbTitle">全部照片</h2>
+        <span class="count" id="crumbCount">0 张</span>
+      </div>
+      <div class="toolbar-right">
+        <div class="segmented" id="groupSeg">
+          <button data-group="theme" class="on">主题</button>
+          <button data-group="month">月份</button>
+          <button data-group="folder">文件夹</button>
+        </div>
+        <div class="segmented" id="sizeSeg">
+          <button data-size="s">紧凑</button>
+          <button data-size="m" class="on">标准</button>
+          <button data-size="l">大图</button>
+        </div>
+        <select id="orderSel" class="select">
+          <option value="taken">按拍摄时间</option>
+          <option value="added">按导入时间</option>
+          <option value="name">按文件名</option>
+          <option value="size">按文件大小</option>
+          <option value="conf">按识别置信度</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- AI 查找：把解析出的条件显式摆出来，不命中可点开逐条放宽 -->
+    <div class="ai-panel" id="aiPanel" hidden>
+      <div class="ai-head">
+        <span class="ai-lead">✨ 我这样理解：</span>
+        <span class="engine-tag" id="aiEngineTag" hidden></span>
+        <div class="chips ai-conds" id="aiConds"></div>
+        <button class="btn mini ghost" id="btnAiToggle" hidden></button>
+        <button class="btn mini ghost" id="btnAiEngine" title="切换这句话由谁理解">🧠 自动</button>
+        <button class="btn mini ghost" id="btnAiExit">退出 AI 查找</button>
+      </div>
+      <p class="ai-note" id="aiNote" hidden></p>
+      <div class="ai-tries" id="aiTries"></div>
+    </div>
+
+    <div class="grid-wrap">
+      <div class="grid" id="grid"></div>
+
+      <!-- 空状态 -->
+      <div class="empty" id="emptyState" hidden>
+        <div class="empty-emoji" id="emptyEmoji">🖼️</div>
+        <h3 id="emptyTitle">相册还空着</h3>
+        <p id="emptyDesc">导入一个存放照片的文件夹，软件会自动分析每张照片的色彩、构图、纹理与 EXIF 特征，<br>
+          把它们分到「人像 / 自然风光 / 城市建筑 / 美食 / 动物 / 夜景 / 黑白 / 截图文档」等主题里。</p>
+        <div class="empty-actions" id="emptyActions">
+          <button class="btn primary" id="btnImport2">＋ 选择文件夹导入</button>
+          <button class="btn ghost" id="btnDemo">✨ 先生成示例照片看效果</button>
+        </div>
+        <div class="empty-common" id="commonPaths"></div>
+      </div>
+
+      <div class="loadmore" id="loadMoreWrap" hidden>
+        <button class="btn ghost" id="btnLoadMore">继续加载</button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- ---------------- 导入弹窗 ---------------- -->
+<div class="modal" id="importModal" hidden>
+  <div class="modal-card">
+    <h3>导入照片文件夹</h3>
+    <p class="modal-desc">把文件夹的完整路径粘贴到下面（可多个，每行一个）。软件只读取照片，
+      不会改动、移动或删除任何文件。</p>
+    <textarea id="importPaths" rows="4" placeholder="例如：&#10;C:\Users\hp\Pictures&#10;D:\照片\2025旅行"></textarea>
+    <div class="chips" id="importChips"></div>
+    <label class="check"><input type="checkbox" id="importRecursive" checked> 包含子文件夹</label>
+    <div class="modal-actions">
+      <button class="btn ghost" data-close="importModal">取消</button>
+      <button class="btn primary" id="btnDoImport">开始识别</button>
+    </div>
+  </div>
+</div>
+
+<!-- ---------------- 大图查看 ---------------- -->
+<div class="lightbox" id="lightbox" hidden>
+  <button class="lb-close" id="lbClose" title="关闭（Esc）">✕</button>
+  <button class="lb-nav prev" id="lbPrev" title="上一张（←）">‹</button>
+  <button class="lb-nav next" id="lbNext" title="下一张（→）">›</button>
+  <div class="lb-body">
+    <div class="lb-img"><img id="lbImage" alt=""></div>
+    <div class="lb-info">
+      <h3 id="lbName">—</h3>
+      <div class="lb-theme">
+        <span class="badge" id="lbBadge">—</span>
+        <span class="conf" id="lbConf"></span>
+        <span class="manual-tag" id="lbManual" hidden>人工设定</span>
+      </div>
+      <p class="lb-reason" id="lbReason"></p>
+      <div class="lb-scores" id="lbScores"></div>
+      <dl class="lb-meta" id="lbMeta"></dl>
+      <div class="lb-change">
+        <label>改成其它主题：</label>
+        <select id="lbThemeSel"></select>
+        <button class="btn mini primary" id="lbApply">应用</button>
+        <button class="btn mini ghost" id="lbReset" hidden>恢复自动</button>
+      </div>
+      <p class="lb-path" id="lbPath" title="原图位置"></p>
+      <div class="lb-actions">
+        <a class="btn mini ghost" id="lbOpen" href="#" target="_blank">打开原图</a>
+        <button class="btn mini ghost" id="lbRemove" title="仅从相册记录中移除，原图保留">从相册移除</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ---------------- AI 模型设置 ---------------- -->
+<div class="modal" id="llmModal" hidden>
+  <div class="modal-card wide">
+    <h3>AI 理解设置 · 云端或本地模型</h3>
+    <p class="modal-desc">启用之后：（1）「AI 查找」把这句话交给模型理解；
+      （2）照片逐张看图写描述，（3）主题分组以模型看到的画面为准。<br>
+      模型不可用（没启用 / 连不上 / 额度用完）时自动回到本地规则，软件照常可用；
+      命中理由永远是本机算的。<br>
+      <b>Key 只写进本机的 data/llm.json，界面上只显示后 4 位。</b>
+      <a class="lk" href="https://platform.deepseek.com/api_keys" target="_blank">去 DeepSeek 建个 API Key ↗</a>
+      <a class="lk" href="https://bailian.console.aliyun.com/" target="_blank">去阿里云百炼建个 API Key ↗</a>
+      <a class="lk" href="https://ollama.com/library" target="_blank">本地免费视觉模型（Ollama）↗</a></p>
+
+    <label class="check big"><input type="checkbox" id="llmEnabled"> 启用 AI 模型（关掉则全部用本地规则）</label>
+    <p class="llm-now" id="llmNow"></p>
+
+    <div class="field">
+      <label for="llmKey">API Key</label>
+      <input id="llmKey" type="password" placeholder="sk-…（本地模型留空即可；留空表示不修改已存的）" autocomplete="off" spellcheck="false">
+      <em id="llmKeyHint"></em>
+    </div>
+    <div class="field">
+      <label for="llmTextModel">文本模型</label>
+      <input id="llmTextModel" placeholder="云端如 deepseek-flash / 本机如 qwen2.5:7b" spellcheck="false">
+      <em>负责把口语句子翻成检索条件</em>
+    </div>
+    <div class="field">
+      <label for="llmVlModel">视觉模型</label>
+      <input id="llmVlModel" placeholder="云端如 deepseek-flash / 本机如 llava:13b" spellcheck="false">
+      <em>负责看图；界面与任务进度条上都显示这个名字</em>
+    </div>
+    <div class="field">
+      <label for="llmBase">接口地址</label>
+      <input id="llmBase" spellcheck="false">
+      <em id="llmBaseHint">云端服务需要 API Key；填本机地址（127.0.0.1）不需要 Key</em>
+    </div>
+    <div class="preset">
+      <span>接口地址快速填入：</span>
+      <button class="btn mini ghost" data-base="http://127.0.0.1:11434/v1">本机 Ollama :11434</button>
+      <button class="btn mini ghost" data-base="http://127.0.0.1:1234/v1">本机 LM Studio :1234</button>
+      <button class="btn mini ghost" data-base="http://127.0.0.1:8080/v1">本机 llama.cpp :8080</button>
+      <button class="btn mini ghost" data-base="https://api.deepseek.com">云端 DeepSeek（要 Key）</button>
+      <button class="btn mini ghost" data-base="https://dashscope.aliyuncs.com/compatible-mode/v1">云端百炼（要 Key）</button>
+    </div>
+    <div class="field cols">
+      <div><label for="llmWorkers">并发数</label><input id="llmWorkers" type="number" min="1" max="16"></div>
+      <div><label for="llmTimeout">超时（秒）</label><input id="llmTimeout" type="number" min="5" max="600"></div>
+      <div><label for="llmMaxPx">图片边长</label><input id="llmMaxPx" type="number" min="512" max="2048" step="128"></div>
+    </div>
+
+    <div class="llm-cost" id="llmCost"></div>
+    <label class="check"><input type="checkbox" id="llmForce"> 连已经写过描述的照片也重跑一遍（云端会再多花一次 token）</label>
+
+    <div class="modal-actions spread">
+      <button class="btn ghost" id="btnLlmTest">测试连接</button>
+      <button class="btn ghost" id="btnLlmClearKey">清除 Key</button>
+      <span class="grow"></span>
+      <button class="btn ghost" data-close="llmModal">关闭</button>
+      <button class="btn ghost" id="btnLlmReset">清除 AI 描述</button>
+      <button class="btn primary" id="btnLlmSave">保存</button>
+      <button class="btn primary" id="btnLlmLabel">✨ 看图写描述</button>
+    </div>
+    <p class="llm-msg" id="llmMsg"></p>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+<script src="/static/js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+Flask>=3.0
+Pillow>=10.0
+numpy>=1.26
+opencv-python-headless>=4.10   # 可选增强：肤色连通域 / 直线检测；缺失时自动降级
+pillow-heif>=1.8               # 可选增强：读 iPhone 的 .heic/.heif；缺失时不影响启动，只是这类照片认不出来
