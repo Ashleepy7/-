@@ -10,6 +10,8 @@ const S = {
   group: 'theme',          // theme | month | folder
   theme: '',               // 选中的主题 id，'' = 全部
   month: '',
+  year: '',                // 侧栏「年→月」层级：选中的整年（与 month 互斥）
+  shot: '',                // 'unknown' = 只看无 EXIF 拍摄时间的照片（与其他时间/主题筛选互斥）
   folder: '',
   root: '',
   q: '',
@@ -88,7 +90,7 @@ function renderSidebar() {
 
   $('#themeList').innerHTML = rows.map((t) => {
     const pct = total ? Math.round((t.count / total) * 100) : 0;
-    const on = S.theme === t.id && !S.month && !S.folder && !S.root;
+    const on = S.theme === t.id && !S.month && !S.year && !S.shot && !S.folder && !S.root;
     return `<li class="theme-item ${on ? 'on' : ''}" data-theme="${t.id}">
       <span class="em">${t.emoji}</span>
       <span class="nm"><b>${esc(t.name)}</b>
@@ -98,9 +100,31 @@ function renderSidebar() {
     </li>`;
   }).join('');
 
-  $('#monthList').innerHTML = st.months.slice(0, 10).map((m) =>
-    `<li class="mini-item ${S.month === m.key ? 'on' : ''}" data-month="${esc(m.key)}">
-       <span>📅 ${esc(m.key || '未知时间')}</span><b>${m.c}</b></li>`).join('') || '<li class="mini-item">—</li>';
+  // 先按年份、年份可展开再列月份（手风琴）：点年份=筛整年，展开后再点其中月份=筛该月
+  const years = st.years || [];
+  const isOpen = (y) => S.year === y || (S.month && String(S.month).slice(0, 4) === y);
+  $('#monthList').innerHTML = years.map((yr) => {
+    const open = isOpen(yr.year);
+    const head = `<li class="mini-item ${S.year === yr.year ? 'on' : ''}" data-year="${esc(yr.year)}">
+       <span>${open ? '▾' : '▸'} 🗓️ ${esc(yr.year)} 年</span><b>${yr.c}</b></li>`;
+    const ms = yr.months.map((m) =>
+      `<li class="mini-item ${S.month === m.key ? 'on' : ''}" data-month="${esc(m.key)}"
+         style="padding-left:22px;${open ? '' : 'display:none'}">
+         <span>📅 ${esc(String(m.key).slice(5))} 月</span><b>${m.c}</b></li>`).join('');
+    return head + ms;
+  }).join('') || '<li class="mini-item">—</li>';
+
+  // 时间未知说明：避免用户疑惑“为什么某些照片在任何年份/月份都筛不出来”
+  const unk = (st.stats && st.stats.shot_unknown) || 0;
+  const tipEl = $('#timeTip');
+  if (tipEl) {
+    tipEl.hidden = !unk;
+    const on = S.shot === 'unknown';
+    tipEl.innerHTML = unk
+      ? `🕓 另有 ${unk} 张没有 EXIF 拍摄时间，按时间查找时不纳入。`
+        + `<a href="#" data-unknown="1" style="color:${on ? '#e0a458' : '#7c5cff'};text-decoration:none;margin-left:4px">${on ? '⟵ 查看全部' : '查看这些 →'}</a>`
+      : '';
+  }
 
   $('#folderList').innerHTML = st.folders.slice(0, 8).map((f) =>
     `<li class="mini-item ${S.folder === f.key ? 'on' : ''}" data-folder="${esc(f.key)}" title="${esc(f.key)}">
@@ -136,7 +160,9 @@ function renderCrumb() {
     emoji = '✨';
     title = S.aiText ? `AI 查找：“${S.aiText}”` : 'AI 查找';
   } else if (S.theme) { const t = themeMeta(S.theme); emoji = t.emoji; title = t.name; }
+  else if (S.year) { emoji = '🗓️'; title = `${S.year} 年`; }
   else if (S.month) { emoji = '📅'; title = S.month; }
+  else if (S.shot) { emoji = '🕓'; title = '拍摄时间未知'; }
   else if (S.folder) { emoji = '📁'; title = shortFolder(S.folder); }
   else if (S.root) { emoji = '💽'; title = shortFolder(S.root); }
   else if (S.q) { emoji = '🔍'; title = `搜索“${S.q}”`; }
@@ -147,7 +173,7 @@ function renderCrumb() {
 
   // 分组控件只在无筛选（分区视图）时有意义，筛选态下变淡提示
   const filtered = S.aiMode ? !!S.aiText
-    : !!(S.theme || S.month || S.folder || S.root || S.q);
+    : !!(S.theme || S.month || S.year || S.shot || S.folder || S.root || S.q);
   $('#groupSeg').classList.toggle('muted', filtered);
   $('#groupSeg').title = filtered ? '当前显示的是筛选结果，切换分组会清除筛选' : '';
 }
@@ -208,7 +234,7 @@ async function loadFlat(reset = true) {
     $('#grid').append(holder);
   }
   const q = new URLSearchParams({
-    theme: S.theme, month: S.month, folder: S.folder, root: S.root,
+    theme: S.theme, month: S.month, year: S.year, shot: S.shot, folder: S.folder, root: S.root,
     q: S.q, order: S.order, page: S.page, size: PAGE_SIZE,
   });
   const data = await api(`/api/photos?${q}`);
@@ -233,8 +259,12 @@ async function loadSections() {
     sections = st.themes.filter((t) => t.count > 0)
       .map((t) => ({ key: t.id, label: `${t.emoji} ${t.name}`, color: t.color, count: t.count, param: `theme=${t.id}` }));
   } else if (S.group === 'month') {
-    sections = st.months.filter((m) => m.key).slice(0, 14)
-      .map((m) => ({ key: m.key, label: `📅 ${m.key}`, color: '#7c5cff', count: m.c, param: `month=${encodeURIComponent(m.key)}` }));
+    sections = (st.years || []).filter((y) => y.c > 0).slice(0, 14)
+      .map((y) => ({
+        key: y.year, label: `🗓️ ${y.year} 年`, color: '#7c5cff', count: y.c,
+        param: `year=${encodeURIComponent(y.year)}`,
+        subs: y.months.map((m) => ({ p: `month=${encodeURIComponent(m.key)}`, t: String(m.key).slice(5) + ' 月', c: m.c })),
+      }));
   } else {
     sections = st.folders.slice(0, 14)
       .map((f) => ({ key: f.key, label: `📁 ${shortFolder(f.key)}`, color: '#22d3ee', count: f.c, param: `folder=${encodeURIComponent(f.key)}` }));
@@ -242,10 +272,14 @@ async function loadSections() {
 
   for (const sec of sections) {
     const box = document.createElement('section');
+    const subHtml = (sec.subs && sec.subs.length)
+      ? `<div style="display:flex;flex-wrap:wrap;gap:6px;margin:2px 0 8px">` +
+        sec.subs.map((s) => `<a href="#" data-jump="${esc(s.p)}" style="font-size:12px;color:#9aa6bf;text-decoration:none;border:1px solid #2b3140;border-radius:6px;padding:1px 8px">${esc(s.t)} · ${s.c}</a>`).join('') + `</div>`
+      : '';
     box.innerHTML = `<h3 class="section-h"><i class="dot" style="background:${sec.color}"></i>
         ${esc(sec.label)} <span>${sec.count} 张</span>
         <a href="#" data-jump="${esc(sec.param)}" style="margin-left:auto;font-size:12px;color:#9aa6bf;text-decoration:none">查看完整 →</a></h3>
-        <div class="cells size-${S.size}"></div>`;
+        ${subHtml}<div class="cells size-${S.size}"></div>`;
     $('#grid').append(box);
     const holder = box.querySelector('.cells');
     try {
@@ -267,6 +301,7 @@ function boxJumpHooks() {
     const params = new URLSearchParams(a.dataset.jump);
     S.theme = params.get('theme') || '';
     S.month = params.get('month') || '';
+    S.year = params.get('year') || '';
     S.folder = params.get('folder') || '';
     S.root = '';
     renderSidebar();
@@ -318,7 +353,7 @@ function setAiMode(on) {
   S.aiKeep = [];
   S.ai = null;
   if (S.aiMode) {
-    S.theme = S.month = S.folder = S.root = '';
+    S.theme = S.month = S.folder = S.root = S.year = S.shot = '';
     S.q = '';
     S.aiText = had;               // 输入框里已经有字，直接拿它当描述
   } else {
@@ -402,6 +437,13 @@ function renderAiPanel(d) {
     noteText = d.note; noteShow = true;
   } else if (d && !d.items.length) {
     noteText = '这些条件一张都没命中，点上面的条件可以先忽略它再找一次。'; noteShow = true;
+  }
+  // 本次用了时间条件时，补一句“还有 N 张时间未知的照片没纳入”
+  const hasTime = d && d.conds && d.conds.some((c) => c.kind === 'time');
+  const unkShot = (S.state && S.state.stats && S.state.stats.shot_unknown) || 0;
+  if (hasTime && unkShot) {
+    noteText = (noteText ? noteText + '；' : '') + `另有 ${unkShot} 张拍摄时间未知的照片未纳入`;
+    noteShow = true;
   }
   const note = $('#aiNote');
   note.textContent = noteText;
@@ -746,7 +788,7 @@ async function openLightbox(id) {
 
   const ex = d.exif || {};
   const rows = [
-    ['拍摄时间', d.taken || '—'],
+    ['拍摄时间', d.taken || '<b style="color:#e0a458">未知</b>（无 EXIF 拍摄时间 · 不参与按时间查找）'],
     ['尺寸', `${d.width} × ${d.height}（${d.feats?.megapixels || '-'} MP）`],
     ['文件大小', fmtBytes(d.bytes)],
     ['来源文件夹', esc(shortFolder(d.folder))],
@@ -786,21 +828,41 @@ function bind() {
     const li = e.target.closest('[data-theme]');
     if (!li) return;
     leaveAi();
-    S.theme = li.dataset.theme; S.month = S.folder = S.root = '';
+    S.theme = li.dataset.theme; S.month = S.folder = S.root = S.year = S.shot = '';
     renderSidebar(); renderMain();
   });
   $('#monthList').addEventListener('click', (e) => {
-    const li = e.target.closest('[data-month]');
-    if (!li) return;
+    const yb = e.target.closest('[data-year]');
+    if (yb) {
+      leaveAi();
+      const y = yb.dataset.year;
+      S.month = S.theme = S.folder = S.root = S.shot = '';
+      S.year = (S.year === y) ? '' : y;   // 再点同一年标题 = 取消整年筛选并收起
+      renderSidebar(); renderMain();
+      return;
+    }
+    const mb = e.target.closest('[data-month]');
+    if (mb) {
+      leaveAi();
+      S.month = mb.dataset.month; S.year = S.theme = S.folder = S.root = S.shot = '';
+      renderSidebar(); renderMain();
+    }
+  });
+  // 点侧栏「时间未知」提示：把这批没有 EXIF 拍摄时间的照片单独列出来核对
+  $('#timeTip').addEventListener('click', (e) => {
+    const a = e.target.closest('[data-unknown]');
+    if (!a) return;
+    e.preventDefault();
     leaveAi();
-    S.month = li.dataset.month; S.theme = S.folder = S.root = '';
+    S.shot = (S.shot === 'unknown') ? '' : 'unknown';
+    S.theme = S.month = S.year = S.folder = S.root = '';
     renderSidebar(); renderMain();
   });
   $('#folderList').addEventListener('click', (e) => {
     const li = e.target.closest('[data-folder]');
     if (!li) return;
     leaveAi();
-    S.folder = li.dataset.folder; S.theme = S.month = S.root = '';
+    S.folder = li.dataset.folder; S.theme = S.month = S.root = S.year = S.shot = '';
     renderSidebar(); renderMain();
   });
   $('#rootList').addEventListener('click', async (e) => {
@@ -815,7 +877,7 @@ function bind() {
     const li = e.target.closest('[data-root]');
     if (!li) return;
     leaveAi();
-    S.root = li.dataset.root; S.theme = S.month = S.folder = '';
+    S.root = li.dataset.root; S.theme = S.month = S.folder = S.year = S.shot = '';
     renderSidebar(); renderMain();
   });
 
@@ -946,7 +1008,7 @@ function bind() {
     $$('#groupSeg button').forEach((x) => x.classList.toggle('on', x === b));
     leaveAi();
     S.group = b.dataset.group;
-    S.theme = S.month = S.folder = S.root = '';
+    S.theme = S.month = S.folder = S.root = S.year = S.shot = '';
     renderSidebar(); renderMain();
   });
 

@@ -57,7 +57,7 @@ def _tags(v) -> list[str]:
 
 def _row_out(r: dict) -> dict:
     meta = theme_meta(r.get("theme") or UNKNOWN_ID)
-    taken = r.get("taken_at") or r.get("mtime") or 0
+    taken = r.get("taken_at") or 0
     return {
         "id": r["id"],
         "name": r["filename"],
@@ -92,6 +92,12 @@ def index():
     return render_template("index.html", themes=THEMES)
 
 
+@app.get("/review")
+def review_page():
+    """人工审核台：逐张纠正主题/黑白风格/描述/标签/人数，并写评测参考答案。"""
+    return render_template("review.html", themes=THEMES)
+
+
 # ---------------------------------------------------------------------- 状态
 
 @app.get("/api/state")
@@ -103,6 +109,8 @@ def api_state():
         "ok": True,
         "stats": {"total": st["total"], "bytes": st["bytes"],
                   "done": st["done"], "errors": st["errors"],
+                  "shot_unknown": st.get("shot_unknown", 0),
+                  "shot_known": st.get("shot_known", 0),
                   "organized": st["total"] - counts.get(UNKNOWN_ID, 0)},
         "job": library.snapshot(),
         "roots": roots,
@@ -110,6 +118,7 @@ def api_state():
         "themes": [{"id": tid, **meta, "count": counts.get(tid, 0)}
                   for tid, meta in THEMES.items()],
         "months": db.group_counts("month")[:24],
+        "years": db.group_years(),
         "folders": db.group_counts("folder")[:24],
         "ai_examples": query.EXAMPLES,
         "ai": db.ai_counts(),
@@ -197,14 +206,16 @@ def api_photos():
     theme = request.args.get("theme", "").strip()
     q = request.args.get("q", "").strip()
     month = request.args.get("month", "").strip()
+    year = request.args.get("year", "").strip()
+    shot = request.args.get("shot", "").strip()
     folder = request.args.get("folder", "").strip()
     root = request.args.get("root", "").strip()
     page = _num(request.args.get("page") or 1, 1, 1, 10 ** 6)
     size = _num(request.args.get("size") or 200, 200, 1, PAGE_MAX)
     order = request.args.get("order", "taken")
-    total = db.count_photos(theme=theme, q=q, month=month, folder=folder, root=root)
+    total = db.count_photos(theme=theme, q=q, month=month, folder=folder, root=root, year=year, shot=shot)
     rows = db.query_photos(theme=theme, q=q, month=month, folder=folder, root=root,
-                           limit=size, offset=(page - 1) * size, order=order)
+                           limit=size, offset=(page - 1) * size, order=order, year=year, shot=shot)
     return jsonify({"total": total, "page": page, "size": size,
                     "items": [_row_out(r) for r in rows]})
 
@@ -363,14 +374,20 @@ def api_photo_auto(pid: int):
         data = features.analyze(r["path"])
     except Exception as exc:
         return jsonify({"ok": False, "error": f"原图无法解析：{exc}"}), 500
-    theme, conf, scores, reasons = classifier.classify(data["feats"])
+    rule_theme, conf, scores, reasons = classifier.classify(data["feats"])
+    # 交回自动 = 取消人工后按显示优先级 模型>规则 回落，和审核台下拉选空的
+    # update_review(theme="") 行为一致。模型已有判定就用模型的，别退回规则结果。
+    ai = (r.get("ai_theme") or "").strip()
+    theme = ai or rule_theme
     db.update_analysis(pid, {
         "width": data["width"], "height": data["height"],
         "taken_at": data["taken_at"], "month": data["month"],
         "exif": data["exif"], "feats": data["feats"], "theme": theme, "conf": conf,
         "scores": scores, "reasons": reasons, "status": "done",
+        "rule_theme": rule_theme,
     })
-    return jsonify({"ok": True, "theme": theme, "theme_name": THEMES[theme]["name"],
+    return jsonify({"ok": True, "theme": theme,
+                    "theme_name": THEMES.get(theme, THEMES.get(rule_theme, {})).get("name", theme),
                     "conf": round(conf * 100), "reasons": reasons})
 
 
@@ -379,6 +396,62 @@ def api_photo_delete(pid: int):
     """从相册数据库移除记录（磁盘上的原图保持不变）。"""
     db.delete_photo(pid)
     return jsonify({"ok": True, "note": "仅从相册移除，原图仍在原位置"})
+
+
+# ---------------------------------------------------------------- 人工审核台
+
+def _review_out(r: dict) -> dict:
+    """审核台行输出：在通用结构上附“三方主题对照 + 可编辑字段 + 人工真值”。"""
+    meta = theme_meta(r.get("theme") or UNKNOWN_ID)
+    taken = r.get("taken_at") or 0
+    return {
+        "id": r["id"], "name": r["filename"], "folder": r["folder"],
+        "theme": r.get("theme") or UNKNOWN_ID, "theme_name": meta["name"],
+        "theme_emoji": meta["emoji"], "theme_color": meta["color"],
+        "theme_src": db.theme_src(r), "manual": bool(r.get("manual")),
+        "conf": round((r.get("conf") or 0) * 100),
+        "ai_theme": r.get("ai_theme") or "", "rule_theme": r.get("rule_theme") or "",
+        "ai_status": r.get("ai_status") or "none",
+        "caption": r.get("caption") or "", "tags": _tags(r.get("tags")),
+        "people": int(r.get("people") if r.get("people") is not None else -1),
+        "mono_style": int(r.get("mono_style") or 0),
+        "gt_theme": r.get("gt_theme") or "", "reviewed": int(r.get("reviewed") or 0),
+        "taken": time.strftime("%Y-%m-%d", time.localtime(taken)) if taken else "",
+        "thumb": f"/api/thumb/{r['id']}", "file": f"/api/file/{r['id']}",
+    }
+
+
+@app.get("/api/review")
+def api_review_list():
+    flag = request.args.get("flag", "unreviewed").strip()
+    q = request.args.get("q", "").strip()
+    theme = request.args.get("theme", "").strip()
+    page = _num(request.args.get("page") or 1, 1, 1, 10 ** 6)
+    size = _num(request.args.get("size") or 48, 48, 1, 200)
+    total = db.review_count(flag, q, theme)
+    rows = db.review_list(flag, q, theme, limit=size, offset=(page - 1) * size)
+    return jsonify({"ok": True, "total": total, "page": page, "size": size,
+                    "flags": db.review_flags(),
+                    "items": [_review_out(r) for r in rows]})
+
+
+@app.post("/api/review/<int:pid>")
+def api_review_save(pid: int):
+    """审核台保存一张的修改。只接收白名单字段；改 theme 会同时 manual=1。"""
+    body = request.get_json(force=True, silent=True) or {}
+    patch = {k: body[k] for k in
+             ("theme", "mono_style", "reviewed", "gt_theme", "caption", "tags", "people")
+             if k in body}
+    if not patch:
+        return jsonify({"ok": False, "error": "没有要保存的字段"}), 400
+    if patch.get("theme") and patch["theme"] not in THEMES:
+        return jsonify({"ok": False, "error": "未知主题"}), 400
+    if patch.get("gt_theme") and patch["gt_theme"] not in THEMES:
+        return jsonify({"ok": False, "error": "未知参考答案主题"}), 400
+    row = db.update_review(pid, patch)
+    if row is None:
+        abort(404)
+    return jsonify({"ok": True, "item": _review_out(row)})
 
 
 # ---------------------------------------------------------------------- 图片

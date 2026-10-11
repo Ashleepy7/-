@@ -115,14 +115,43 @@ def _night(f: dict, s: _Score) -> None:
     s.plus(0.5, ramp(f.get("purple_ratio", 0) + f.get("blue_ratio", 0), 0.25, 0.55), "偏冷的蓝紫色调")
     s.minus(0.9, ramp(f.get("white_bg", 0), 0.30, 0.55), "大面积纯白背景")
     s.minus(0.8, ramp(bright, 0.55, 0.80), "画面整体明亮")
+    # 注：试过给夜景加“强结构直线→归城市”的罚项，但实测净负（夜景天际线本身
+    # 就含大量建筑直线，会误伤正当夜景）；且城市/夜景的实际错判来自模型侧，
+    # 不靠规则旋钮掩盖。故保留旧阈值，城市/夜景的定义改在 config desc + 未来重标注 prompt。
 
 
 def _mono(f: dict, s: _Score) -> None:
+    # 已废弃：黑白不再当“和肖像/城市互斥的内容主题”抢一个名额（那会把黑白人像
+    # 判错）。风格判定改用下面的 mono_score()，_mono 仅为旧数据行保留、不进 SCORERS。
     satm, neutral = f.get("sat_mean", 1), f.get("neutral_ratio", 0)
     s.plus(3.0, ramp(0.11 - satm, 0, 0.06), f"几乎无彩色（平均饱和 {satm:.2f}）")
     s.plus(1.2, ramp(neutral, 0.85, 0.98), "灰阶覆盖全图")
     s.minus(1.4, ramp(f.get("palette_flat", 0), 0.40, 0.70), "超大纯色块，更像截图")
     s.minus(0.8, ramp(f.get("white_bg", 0), 0.45, 0.70), "纯白背景占比过高")
+
+
+def mono_score(f: dict) -> float:
+    """黑白/单色风格强度 0~1。与内容正交：一张黑白人像仍然是人像，只是额外带“黑白”风格。
+
+    用现有 feats（sat_mean/neutral_ratio/palette_flat/white_bg）本地算，
+    不需解码也不需模型，因此可全库免费回填。
+    """
+    f = f or {}
+    satm = f.get("sat_mean", 1.0)
+    # 低饱和主导：sat_mean<=0.05 给满，0.11 以上为 0
+    sat_strength = ramp(0.11 - satm, 0.0, 0.06)
+    # 灰阶覆盖度作为辅助证据（不能单独拉高，否则低饱和的截图也进来）
+    gray_strength = ramp(f.get("neutral_ratio", 0), 0.80, 0.95)
+    base = 0.78 * sat_strength + 0.22 * gray_strength
+    # 降权非摄影的黑白：超大纯色块 / 纯白底（那些是图形/截图不是黑白照片）
+    base -= 0.45 * ramp(f.get("palette_flat", 0), 0.40, 0.70)
+    base -= 0.30 * ramp(f.get("white_bg", 0), 0.45, 0.70)
+    return round(max(0.0, min(1.0, base)), 3)
+
+
+def is_mono(f: dict, thr: float = 0.5) -> bool:
+    """黑白风格判定：强度过阈即为黑白（thr 可在评测里调）。"""
+    return mono_score(f) >= thr
 
 
 def _screenshot(f: dict, s: _Score) -> None:
@@ -147,8 +176,8 @@ SCORERS = {
     "food": _food,
     "animal": _animal,
     "night": _night,
-    "mono": _mono,
     "screenshot": _screenshot,
+    # 注：mono 已从互斥主题池移出，改走正交风格轴（mono_score/is_mono）。
 }
 
 BASE_SCORE = 0.55          # 未归类基准线：没有任何主题明显胜出时落到未归类

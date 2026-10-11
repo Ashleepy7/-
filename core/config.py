@@ -31,11 +31,11 @@ CONF_THRESHOLD = 0.28     # 置信度（领先幅度+得分强度）低于该值
 THEMES: dict[str, dict[str, str]] = {
     "portrait":   {"name": "人像自拍", "emoji": "🧑", "color": "#f472b6", "desc": "人物、自拍、合影"},
     "nature":     {"name": "自然风光", "emoji": "🏞️", "color": "#34d399", "desc": "山川湖海、天空绿地"},
-    "city":       {"name": "城市建筑", "emoji": "🏙️", "color": "#60a5fa", "desc": "楼宇街道、几何线条"},
+    "city":       {"name": "城市建筑", "emoji": "🏙️", "color": "#60a5fa", "desc": "楼宇街道、几何线条（主体是结构，不论昼夜）"},
     "food":       {"name": "美食饮品", "emoji": "🍜", "color": "#fb923c", "desc": "餐点、咖啡、暖色特写"},
     "animal":     {"name": "动物宠物", "emoji": "🐾", "color": "#a78bfa", "desc": "猫狗宠物、野生动物"},
-    "night":      {"name": "夜景暗光", "emoji": "🌃", "color": "#818cf8", "desc": "夜晚、灯光、暗调"},
-    "mono":       {"name": "黑白影像", "emoji": "🎞️", "color": "#cbd5e1", "desc": "低饱和、黑白灰"},
+    "night":      {"name": "夜景暗光", "emoji": "🌃", "color": "#818cf8", "desc": "夜晚、灯光、暗调（主体是灯光/夜色，不是被拍暗的建筑）"},
+    "mono":       {"name": "黑白影像", "emoji": "🎞️", "color": "#cbd5e1", "desc": "黑白/单色（与内容正交的风格标记，非互斥主题）"},
     "screenshot": {"name": "截图文档", "emoji": "📄", "color": "#22d3ee", "desc": "屏幕截图、文字资料"},
     "other":      {"name": "未归类", "emoji": "🗂️", "color": "#94a3b8", "desc": "特征不明确，待人工整理"},
 }

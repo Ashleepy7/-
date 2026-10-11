@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>人工审核台 · 灵犀相册</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛠️</text></svg>">
+  <style>
+    /* 审核台自带样式，作用域限定在 .rv 前缀内，不依赖也不修改 static/css/style.css */
+    * { box-sizing: border-box; }
+    body.rvbody { margin: 0; background: #0f1115; color: #e6e8ee;
+      font: 14px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+    .rv-top { position: sticky; top: 0; z-index: 5; background: #161a22;
+      border-bottom: 1px solid #262b36; padding: 12px 18px; }
+    .rv-title { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .rv-title h1 { font-size: 18px; margin: 0; }
+    .rv-title a { color: #8ab4ff; text-decoration: none; font-size: 13px; }
+    .rv-title .spacer { flex: 1; }
+    .rv-search { background: #0f1115; border: 1px solid #2b3140; color: #e6e8ee;
+      border-radius: 8px; padding: 7px 10px; width: 220px; }
+    .rv-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+    .rv-tab { background: #1d222c; border: 1px solid #2b3140; color: #cfd4df;
+      border-radius: 999px; padding: 5px 12px; cursor: pointer; font-size: 13px; }
+    .rv-tab.on { background: #2f6feb; border-color: #2f6feb; color: #fff; }
+    .rv-tab b { font-weight: 700; margin-left: 5px; opacity: .85; }
+    .rv-hint { color: #8890a0; font-size: 12px; margin: 10px 18px 0; }
+    .rv-grid { display: grid; gap: 14px; padding: 14px 18px 60px;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+    .rv-card { background: #161a22; border: 1px solid #262b36; border-radius: 12px;
+      overflow: hidden; display: flex; flex-direction: column; }
+    .rv-card.done { border-color: #2c6b3f; }
+    .rv-thumb { display: block; width: 100%; height: 200px; object-fit: cover;
+      background: #0a0c10; cursor: zoom-in; }
+    .rv-body { padding: 10px 12px 12px; display: flex; flex-direction: column; gap: 9px; }
+    .rv-name { font-size: 12px; color: #9aa2b1; word-break: break-all; }
+    .rv-ref { display: flex; flex-wrap: wrap; gap: 6px; font-size: 12px; }
+    .rv-chip { background: #1d222c; border: 1px solid #2b3140; border-radius: 6px;
+      padding: 2px 7px; color: #b9c0cf; }
+    .rv-chip.diff { border-color: #7a5a1a; color: #e3b341; }
+    .rv-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .rv-row label { font-size: 12px; color: #9aa2b1; min-width: 62px; }
+    .rv-sel, .rv-in, .rv-area { background: #0f1115; border: 1px solid #2b3140;
+      color: #e6e8ee; border-radius: 7px; padding: 5px 8px; font-size: 13px; }
+    .rv-sel { flex: 1; } .rv-in { width: 72px; }
+    .rv-area { width: 100%; resize: vertical; min-height: 40px; }
+    .rv-btn { background: #1d222c; border: 1px solid #2b3140; color: #dfe3ea;
+      border-radius: 7px; padding: 5px 10px; cursor: pointer; font-size: 12px; }
+    .rv-btn:hover { border-color: #3a4152; }
+    .rv-btn.primary { background: #2f6feb; border-color: #2f6feb; color: #fff; }
+    .rv-btn.ok { background: #215a2f; border-color: #2b7a3f; color: #d6f5df; }
+    .rv-check { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+    .rv-foot { display: flex; gap: 8px; align-items: center; margin-top: 2px; }
+    .rv-msg { font-size: 12px; color: #6fd08c; opacity: 0; transition: opacity .2s; }
+    .rv-msg.show { opacity: 1; }
+    .rv-pager { display: flex; gap: 10px; justify-content: center; align-items: center;
+      padding: 4px 0 40px; color: #9aa2b1; font-size: 13px; }
+    .rv-empty { text-align: center; color: #8890a0; padding: 60px 20px; font-size: 15px; }
+  </style>
+</head>
+<body class="rvbody">
+<div class="rv">
+  <div class="rv-top">
+    <div class="rv-title">
+      <h1>🛠️ 人工审核台</h1>
+      <a href="/">← 返回照片墙</a>
+      <span class="spacer"></span>
+      <select class="rv-sel" id="themeFilter" style="width:140px">
+        <option value="">全部主题</option>
+        {% for tid, m in themes.items() %}<option value="{{ tid }}">{{ m.name }}</option>{% endfor %}
+      </select>
+      <input class="rv-search" id="kw" type="search" placeholder="搜文件名 / 文件夹 / 描述 / 真值…">
+    </div>
+    <div class="rv-tabs" id="tabs">
+      <button class="rv-tab" data-flag="unreviewed">待审 <b>0</b></button>
+      <button class="rv-tab" data-flag="disagree">模型≠规则 <b>0</b></button>
+      <button class="rv-tab" data-flag="lowconf">低置信 <b>0</b></button>
+      <button class="rv-tab" data-flag="unannotated">未跑模型 <b>0</b></button>
+      <button class="rv-tab" data-flag="ungroundtruth">无参考答案 <b>0</b></button>
+      <button class="rv-tab" data-flag="mono">黑白样张 <b>0</b></button>
+      <button class="rv-tab" data-flag="all">全部 <b>0</b></button>
+    </div>
+  </div>
+
+  <div class="rv-hint" id="hint">挑一栏开始逐张核对。改完点「保存」即时写库；「标记已审」把这张移出待审列表。原图不受任何修改影响。</div>
+  <div class="rv-grid" id="grid"></div>
+  <div class="rv-pager" id="pager"></div>
+</div>
+
+<script>
+(function () {
+  var THEMES = [
+    {% for tid, m in themes.items() %}{ id: "{{ tid }}", name: "{{ m.name }}" },{% endfor %}
+  ];
+  var state = { flag: "unreviewed", q: "", theme: "", page: 1, size: 48, total: 0 };
+
+  function optTheme(sel, cur) {
+    var h = sel === "theme" ? '<option value="">交回自动识别</option>'
+          : sel === "gt_theme" ? '<option value="">（未设定）</option>'
+          : '<option value="">（不改）</option>';
+    THEMES.forEach(function (t) {
+      // 黑白已移出互斥内容主题，参考答案不应选 mono（否则该样张主题命中率结构性为 0）
+      if (sel === "gt_theme" && t.id === "mono") return;
+      h += '<option value="' + t.id + '"' + (t.id === cur ? " selected" : "") + '>' + t.name + '</option>';
+    });
+    return h;
+  }
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+
+  function card(r) {
+    var srcTxt = { manual: "人工", ai: "模型", rule: "规则" }[r.theme_src] || r.theme_src;
+    var people = r.people < 0 ? -1 : r.people;
+    // 人数下拉只列 0..8；库里实际 >8（街景常 9~20）时补一项原值，避免显示/写回被抹成 -1
+    var peopleOpts = '<option value="-1"' + (people === -1 ? " selected" : "") + '>未标</option>'
+      + [0,1,2,3,4,5,6,7,8].map(function (n) {
+          return '<option value="' + n + '"' + (people === n ? " selected" : "") + '>' + (n === 8 ? "8+" : n) + '</option>';
+        }).join("");
+    if (people > 8) peopleOpts += '<option value="' + people + '" selected>' + people + '</option>';
+    return '<div class="rv-card' + (r.reviewed ? " done" : "") + '" data-id="' + r.id + '">' +
+      '<img class="rv-thumb" loading="lazy" src="' + r.thumb + '" title="点开看原图" data-file="' + r.file + '">' +
+      '<div class="rv-body">' +
+        '<div class="rv-name">' + esc(r.name) + ' · ' + esc(r.folder.split(/[\\/]/).pop()) +
+          (r.taken ? ' · ' + r.taken : '') + '</div>' +
+        '<div class="rv-ref">' +
+          '<span class="rv-chip">当前 ' + esc(r.theme_name) + '（' + srcTxt + (r.theme_src === "rule" ? " " + r.conf + "%" : "") + '）</span>' +
+          (r.rule_theme ? '<span class="rv-chip' + (r.rule_theme !== r.ai_theme && r.ai_theme ? " diff" : "") + '">规则 ' + nameOf(r.rule_theme) + '</span>' : '') +
+          (r.ai_theme ? '<span class="rv-chip' + (r.rule_theme && r.rule_theme !== r.ai_theme ? " diff" : "") + '">模型 ' + nameOf(r.ai_theme) + '</span>' : '<span class="rv-chip">模型 未标</span>') +
+        '</div>' +
+        '<div class="rv-row"><label>主题</label><select class="rv-sel" data-k="theme" data-init="' + esc(r.theme) + '">' + optTheme("theme", r.theme) + '</select></div>' +
+        '<div class="rv-row"><label>参考答案</label><select class="rv-sel" data-k="gt_theme" data-init="' + esc(r.gt_theme) + '" data-cur="' + esc(r.gt_theme) + '">' + optTheme("gt_theme", r.gt_theme) + '</select>' +
+          '<button class="rv-btn" data-act="copygt" title="把当前显示的主题设为参考答案">设为当前</button></div>' +
+        '<div class="rv-row"><label>描述</label></div>' +
+        '<textarea class="rv-area" data-k="caption" data-init="' + esc(r.caption) + '">' + esc(r.caption) + '</textarea>' +
+        '<div class="rv-row"><label>标签</label><input class="rv-in" style="flex:1;width:auto" data-k="tags" data-init="' + esc(JSON.stringify(r.tags)) + '" value="' + esc(r.tags.join(", ")) + '" placeholder="逗号分隔"></div>' +
+        '<div class="rv-row">' +
+          '<label class="rv-check"><input type="checkbox" data-k="mono_style" data-init="' + (r.mono_style ? 1 : 0) + '"' + (r.mono_style ? " checked" : "") + '> 黑白/单色风格</label>' +
+          '<label>人数</label><select class="rv-sel" data-k="people" data-init="' + people + '" style="flex:0;width:96px">' +
+            peopleOpts + '</select></div>' +
+        '<div class="rv-foot">' +
+          '<button class="rv-btn primary" data-act="save">保存改动</button>' +
+          '<button class="rv-btn" data-act="auto">交回自动</button>' +
+          '<button class="rv-btn ok" data-act="done">标记已审</button>' +
+          '<span class="rv-msg"></span>' +
+        '</div>' +
+      '</div></div>';
+  }
+
+  function nameOf(id) {
+    var t = THEMES.filter(function (x) { return x.id === id; })[0];
+    return t ? t.name : id;
+  }
+
+  function collect(el, k) {
+    if (k === "mono_style") return el.checked ? 1 : 0;
+    if (k === "tags") return el.value.split(/[,，]/).map(function (s) { return s.trim(); }).filter(Boolean);
+    if (k === "people") return parseInt(el.value, 10);
+    return el.value;
+  }
+
+  function msg(row, txt, bad) {
+    var m = row.querySelector(".rv-msg");
+    m.textContent = txt; m.style.color = bad ? "#e3b341" : "#6fd08c";
+    m.classList.add("show"); setTimeout(function () { m.classList.remove("show"); }, 1800);
+  }
+
+  function save(id, patch, cardEl, okText) {
+    fetch("/api/review/" + id, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch)
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (!d.ok) { msg(cardEl, d.error || "保存失败", true); return; }
+      msg(cardEl, okText || "已保存");
+      if (patch.reviewed) cardEl.classList.add("done");
+      if (d.item && patch.theme) {
+        var chip = cardEl.querySelector(".rv-chip");
+        if (chip) chip.textContent = "当前 " + d.item.theme_name + "（人工）";
+      }
+    }).catch(function () { msg(cardEl, "网络错误", true); });
+  }
+
+  function payload(cardEl) {
+    // 只回写真正被改动的字段：拿当前值和渲染时记录的 data-init 比。
+    // 全量回写会把没动的字段（尤其 theme）一起提交，即便服务端已兜住误置 manual，
+    // 也会无谓覆盖 caption/tags/people，且 people>8/tags 边界更容易被抹平。
+    var p = {};
+    cardEl.querySelectorAll("[data-k]").forEach(function (el) {
+      var k = el.getAttribute("data-k");
+      var v = collect(el, k);
+      var init = el.getAttribute("data-init");
+      if (init === null) { p[k] = v; return; }   // 没有初值记录就当作改动
+      if (k === "tags") {
+        var arr; try { arr = JSON.parse(init); } catch (e) { arr = []; }
+        if (JSON.stringify(v) !== JSON.stringify(arr)) p[k] = v;
+      } else if (String(v) !== String(init)) {
+        p[k] = v;
+      }
+    });
+    return p;
+  }
+
+  function renderPager() {
+    var pages = Math.max(1, Math.ceil(state.total / state.size));
+    var pg = document.getElementById("pager");
+    if (pages <= 1) { pg.textContent = state.total + " 张"; return; }
+    pg.innerHTML =
+      '<button class="rv-btn" id="prev"' + (state.page <= 1 ? " disabled" : "") + '>‹ 上一页</button>' +
+      '<span>第 ' + state.page + ' / ' + pages + ' 页（共 ' + state.total + ' 张）</span>' +
+      '<button class="rv-btn" id="next"' + (state.page >= pages ? " disabled" : "") + '>下一页 ›</button>';
+    var pv = document.getElementById("prev"), nx = document.getElementById("next");
+    if (pv) pv.onclick = function () { if (state.page > 1) { state.page--; load(); } };
+    if (nx) nx.onclick = function () { if (state.page < pages) { state.page++; load(); } };
+  }
+
+  function updateTabs(flags) {
+    document.querySelectorAll("#tabs .rv-tab").forEach(function (b) {
+      var f = b.getAttribute("data-flag");
+      b.classList.toggle("on", f === state.flag);
+      b.querySelector("b").textContent = flags[f] != null ? flags[f] : 0;
+    });
+  }
+
+  function load() {
+    var url = "/api/review?flag=" + encodeURIComponent(state.flag) +
+      "&q=" + encodeURIComponent(state.q) + "&theme=" + encodeURIComponent(state.theme) +
+      "&page=" + state.page + "&size=" + state.size;
+    fetch(url).then(function (r) { return r.json(); }).then(function (d) {
+      state.total = d.total;
+      updateTabs(d.flags);
+      var g = document.getElementById("grid");
+      g.innerHTML = d.items.length
+        ? d.items.map(card).join("")
+        : '<div class="rv-empty">这一栏没有照片了 ✅</div>';
+      renderPager();
+      bind(g);
+      document.getElementById("hint").textContent = hintFor(state.flag);
+    });
+  }
+
+  function hintFor(f) {
+    return {
+      unreviewed: "还没人工过目的照片——按规则置信度从低到高排，最可能错的最先出现。",
+      disagree: "模型判的主题和规则不一样：这些是两套系统有分歧的，人工说了算。",
+      lowconf: "规则也没把握（置信度 <55%）且模型还没接管的照片。",
+      unannotated: "还没跑过模型看图标注的照片（新导入的会先进这里）。",
+      ungroundtruth: "评测还没有人工参考答案的照片：设好后 real_check / detail_check 会用你的真值。",
+      mono: "被本地特征判为黑白/单色风格的照片，核对有没有误报/漏报。",
+      all: "库里全部已分析照片。",
+    }[f] || "挑一栏开始逐张核对。";
+  }
+
+  function bind(g) {
+    g.querySelectorAll(".rv-card").forEach(function (c) {
+      var id = parseInt(c.getAttribute("data-id"), 10);
+      c.querySelector(".rv-thumb").onclick = function () {
+        window.open(this.getAttribute("data-file"), "_blank");
+      };
+      c.querySelector('[data-act="save"]').onclick = function () {
+        var p = payload(c);
+        if (!Object.keys(p).length) { msg(c, "没有需要保存的改动"); return; }
+        save(id, p, c);
+      };
+      c.querySelector('[data-act="done"]').onclick = function () {
+        var p = payload(c); p.reviewed = 1;
+        save(id, p, c, "已保存并标记已审");
+      };
+      c.querySelector('[data-act="copygt"]').onclick = function () {
+        var sel = c.querySelector('[data-k="gt_theme"]');
+        sel.value = c.querySelector('[data-k="theme"]').value ||
+          sel.getAttribute("data-cur") || "";
+        save(id, { gt_theme: sel.value }, c, "参考答案已设为当前主题");
+      };
+      c.querySelector('[data-act="auto"]').onclick = function () {
+        fetch("/api/photo/" + id + "/auto", { method: "POST" })
+          .then(function (r) { return r.json(); }).then(function (d) {
+            if (d.ok) { msg(c, "已交回自动识别：" + d.theme_name); setTimeout(load, 500); }
+            else { msg(c, d.error || "失败", true); }
+          });
+      };
+    });
+  }
+
+  document.getElementById("tabs").addEventListener("click", function (e) {
+    var b = e.target.closest(".rv-tab"); if (!b) return;
+    state.flag = b.getAttribute("data-flag"); state.page = 1; load();
+  });
+  var kt;
+  document.getElementById("kw").addEventListener("input", function (e) {
+    clearTimeout(kt); var v = e.target.value;
+    kt = setTimeout(function () { state.q = v.trim(); state.page = 1; load(); }, 350);
+  });
+  document.getElementById("themeFilter").addEventListener("change", function (e) {
+    state.theme = e.target.value; state.page = 1; load();
+  });
+
+  load();
+})();
+</script>
+</body>
+</html>

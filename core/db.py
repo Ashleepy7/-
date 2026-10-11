@@ -55,6 +55,12 @@ _AI_COLS: list[tuple[str, str]] = [
     ("ai_err", "TEXT DEFAULT ''"),
     ("people", "INTEGER DEFAULT -1"),   # 模型看到的人数，-1 表示未标注
     ("rule_theme", "TEXT DEFAULT ''"),   # 用 AI 结果覆盖前，备份原规则分类
+    # 黑白/单色风格轴：与内容主题正交（1=黑白风格，0=否），本地特征回填、不走模型。
+    ("mono_style", "INTEGER DEFAULT 0"),
+    # 人工审核台：gt_theme = 人工确认的「评测参考答案」（real_check/detail_check 优先用），
+    # reviewed = 是否已在审核台被人工过目（1=看过），用于可疑筛选的进度。
+    ("gt_theme", "TEXT DEFAULT ''"),
+    ("reviewed", "INTEGER DEFAULT 0"),
 ]
 
 
@@ -178,6 +184,9 @@ def update_analysis(pid: int, data: dict) -> None:
     extra, args = "", []
     if data.get("rule_theme") is not None:
         extra, args = ", rule_theme=?", [data["rule_theme"]]
+    if data.get("mono_style") is not None:
+        extra += ", mono_style=?"
+        args.append(int(bool(data["mono_style"])))
     with _LOCK, closing(_conn()) as conn:
         conn.execute(
             f"""UPDATE photos SET width=?, height=?, taken_at=?, month=?, exif=?, feats=?,
@@ -193,6 +202,124 @@ def update_analysis(pid: int, data: dict) -> None:
         conn.commit()
 
 
+def all_photo_feats() -> list[tuple[int, dict]]:
+    """回填风格轴用：返回所有已分析过（feats 非空）的 (id, feats)。仅读库、不解码。"""
+    rows = _rows("SELECT id, feats FROM photos WHERE feats IS NOT NULL AND feats != ''")
+    out: list[tuple[int, dict]] = []
+    for r in rows:
+        try:
+            out.append((r["id"], json.loads(r["feats"] or "{}")))
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def set_mono_style(pid: int, val: int) -> None:
+    with _LOCK, closing(_conn()) as conn:
+        conn.execute("UPDATE photos SET mono_style=? WHERE id=?", (int(bool(val)), pid))
+        conn.commit()
+
+
+# ---------------- 人工审核台 ----------------
+
+def update_review(pid: int, patch: dict) -> dict | None:
+    """审核台逐张落库。白名单字段，一次可改多个；未知键忽略。
+
+    - theme: 人工定主题（置 manual=1，与 set_manual_theme 同义）；传空串则回到自动结果。
+    - mono_style / reviewed: 0/1 开关。
+    - caption / tags(list) / people(int) / gt_theme。
+    返回更新后的整行（无此行返回 None）。
+    """
+    row = get_photo(pid)
+    if row is None:
+        return None
+    sets, args = [], []
+    if "theme" in patch:
+        theme = (patch.get("theme") or "").strip()
+        cur = (row.get("theme") or "").strip()
+        if theme and theme != cur:            # 人工真的改成另一个主题才置 manual
+            sets += ["theme=?", "manual=1"]; args += [theme]
+        elif not theme:                        # 交回自动：按显示优先级 模型>规则 回落，清 manual
+            back = row.get("ai_theme") or row.get("rule_theme") or cur
+            sets += ["theme=?", "manual=0"]; args += [back]
+        # theme==cur 且本来就是自动判的 → 没动主题，不写、不误置 manual
+    if "mono_style" in patch:
+        sets.append("mono_style=?"); args.append(int(bool(patch["mono_style"])))
+    if "reviewed" in patch:
+        sets.append("reviewed=?"); args.append(int(bool(patch["reviewed"])))
+    if "gt_theme" in patch:
+        sets.append("gt_theme=?"); args.append((patch.get("gt_theme") or "").strip())
+    if "caption" in patch:
+        sets.append("caption=?"); args.append(str(patch.get("caption") or ""))
+    if "tags" in patch:
+        tags = patch.get("tags") or []
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.replace("，", ",").split(",") if t.strip()]
+        sets.append("tags=?"); args.append(json.dumps(list(tags)[:12], ensure_ascii=False))
+    if "people" in patch:
+        try:
+            ppl = int(patch.get("people"))
+        except (TypeError, ValueError):
+            ppl = -1
+        sets.append("people=?"); args.append(max(ppl, -1))
+    if sets:
+        args.append(pid)
+        _run(f"UPDATE photos SET {', '.join(sets)} WHERE id=?", args)
+    return get_photo(pid)
+
+
+# 可疑筛选：每个 flag 对应一段 WHERE。审核台的标签页按此递“最可能有问题的”照片。
+REVIEW_FLAGS: dict[str, str] = {
+    "disagree": "status='done' AND ai_theme!='' AND rule_theme!='' AND ai_theme!=rule_theme",   # 模型≠规则
+    "lowconf": "status='done' AND manual=0 AND ai_theme='' AND conf<0.55",     # 规则也没把握
+    "unannotated": "status='done' AND ai_status!='done'",                      # 还没跑模型标注
+    "ungroundtruth": "status='done' AND gt_theme=''",                          # 评测还没有人工真值
+    "unreviewed": "status='done' AND reviewed=0",                             # 还没人工过目
+    "mono": "status='done' AND mono_style=1",                                   # 黑白风格样张
+}
+
+
+def review_where(flag: str = "", q: str = "", theme: str = "") -> tuple[str, list]:
+    where, args = ["status='done'"], []
+    if flag == "all" or not flag:
+        pass
+    elif flag in REVIEW_FLAGS:
+        where.append(REVIEW_FLAGS[flag])
+    else:
+        where.append("reviewed=0")            # 未知 flag 归到未审
+    if theme:
+        where.append("theme=?"); args.append(theme)
+    if q:
+        where.append("(filename LIKE ? OR folder LIKE ? OR caption LIKE ? OR gt_theme LIKE ?)")
+        like = f"%{q}%"; args += [like, like, like, like]
+    return " AND ".join(where), args
+
+
+def review_list(flag: str = "", q: str = "", theme: str = "",
+                limit: int = 60, offset: int = 0) -> list[dict]:
+    w, args = review_where(flag, q, theme)
+    sql = """SELECT id, path, filename, folder, width, height, bytes, taken_at, month,
+                    theme, conf, manual, status, caption, tags, ai_theme, ai_status,
+                    rule_theme, people, mono_style, gt_theme, reviewed
+             FROM photos WHERE %s
+             ORDER BY reviewed ASC, conf ASC, id DESC LIMIT ? OFFSET ?""" % w
+    return _rows(sql, tuple(args) + (limit, offset))
+
+
+def review_count(flag: str = "", q: str = "", theme: str = "") -> int:
+    w, args = review_where(flag, q, theme)
+    rows = _rows(f"SELECT COUNT(*) AS c FROM photos WHERE {w}", args)
+    return rows[0]["c"] if rows else 0
+
+
+def review_flags() -> dict:
+    """各筛选项的条数，审核台标签页上显量。"""
+    out = {"all": _rows("SELECT COUNT(*) AS c FROM photos WHERE status='done'")[0]["c"]}
+    for name, cond in REVIEW_FLAGS.items():
+        out[name] = _rows(f"SELECT COUNT(*) AS c FROM photos WHERE {cond}")[0]["c"]
+    return out
+
+
 def update_ai(pid: int, data: dict) -> None:
     """写入 AI 视觉标注结果。
 
@@ -201,21 +328,28 @@ def update_ai(pid: int, data: dict) -> None:
     """
     with _LOCK, closing(_conn()) as conn:
         cur = conn.execute(
-            "SELECT theme, manual, rule_theme FROM photos WHERE id=?", (pid,)).fetchone()
+            "SELECT theme, manual, rule_theme, caption, tags, people FROM photos WHERE id=?",
+            (pid,)).fetchone()
         if cur is None:
             return
         ai_theme = data.get("theme") or ""
         # 人工设定优先于模型；模型没给主题就保持现状
         new_theme = ai_theme if (ai_theme and not cur["manual"]) else cur["theme"]
         backup = cur["rule_theme"] or cur["theme"]    # 多次标注也只留最早那份规则结果
+        # 新值为空而旧值非空时保留旧值：避免“标注失败/重跑”把已有（含人工纠正的）
+        # 描述、标签、人数抹成空。只有拿到新的非空结果才覆盖。
+        new_cap = data.get("caption", "")
+        keep_cap = new_cap if new_cap else (cur["caption"] or "")
+        new_tags = data.get("tags", [])
+        keep_tags = json.dumps(new_tags, ensure_ascii=False) if new_tags else (cur["tags"] or "[]")
+        new_people = int(data.get("people", -1) if data.get("people") is not None else -1)
+        keep_people = new_people if new_people >= 0 else int(cur["people"] if cur["people"] is not None else -1)
         conn.execute(
             """UPDATE photos SET caption=?, tags=?, ai_theme=?, ai_status=?, ai_err=?,
                               people=?, rule_theme=?, theme=? WHERE id=?""",
-            (data.get("caption", ""),
-             json.dumps(data.get("tags", []), ensure_ascii=False),
+            (keep_cap, keep_tags,
              ai_theme, data.get("status", "done"), data.get("error", ""),
-             int(data.get("people", -1) if data.get("people") is not None else -1),
-             backup, new_theme, pid),
+             keep_people, backup, new_theme, pid),
         )
         conn.commit()
 
@@ -322,11 +456,16 @@ def get_photo(pid: int) -> dict | None:
 
 def query_photos(theme: str = "", q: str = "", root: str = "", month: str = "",
                  folder: str = "", limit: int = 500, offset: int = 0,
-                 order: str = "taken") -> list[dict]:
+                 order: str = "taken", year: str = "", shot: str = "") -> list[dict]:
     where, args = ["1=1"], []
     if theme:
         where.append("theme=?")
         args.append(theme)
+    if shot == "unknown":
+        where.append("NULLIF(taken_at,0) IS NULL")
+    if year:
+        where.append("substr(month,1,4)=?")
+        args.append(year)
     if month:
         where.append("month=?")
         args.append(month)
@@ -340,11 +479,11 @@ def query_photos(theme: str = "", q: str = "", root: str = "", month: str = "",
         where.append("(filename LIKE ? OR folder LIKE ? OR theme LIKE ?)")
         like = f"%{q}%"
         args += [like, like, like]
-    sort = {"taken": "COALESCE(NULLIF(taken_at,0), mtime) DESC",
+    sort = {"taken": "NULLIF(taken_at,0) DESC",
             "name": "filename ASC",
             "size": "bytes DESC",
             "conf": "conf DESC",
-            "added": "added_at DESC"}.get(order, "COALESCE(NULLIF(taken_at,0), mtime) DESC")
+            "added": "added_at DESC"}.get(order, "NULLIF(taken_at,0) DESC")
     sql = f"""SELECT id, path, filename, folder, width, height, bytes, mtime, taken_at,
                      month, theme, conf, manual, status, caption, tags, ai_theme, ai_status,
                      rule_theme, people
@@ -357,18 +496,23 @@ def search_rows(where: str = "1=1", args: Iterable[Any] = (), cap: int = 4000) -
     """AI 查找用：额外取出 feats / exif / 语义标注原文，按拍摄时间倒序，最多 cap 条。"""
     sql = f"""SELECT id, path, filename, folder, width, height, bytes, mtime, taken_at,
                      month, theme, conf, manual, status, feats, exif,
-                     caption, tags, ai_theme, people FROM photos
+                     caption, tags, ai_theme, ai_status, rule_theme, people, mono_style FROM photos
               WHERE {where}
-              ORDER BY COALESCE(NULLIF(taken_at,0), mtime) DESC LIMIT ?"""
+              ORDER BY NULLIF(taken_at,0) DESC LIMIT ?"""
     return _rows(sql, tuple(args) + (cap,))
 
 
 def count_photos(theme: str = "", q: str = "", root: str = "", month: str = "",
-                 folder: str = "") -> int:
+                 folder: str = "", year: str = "", shot: str = "") -> int:
     where, args = ["1=1"], []
     if theme:
         where.append("theme=?")
         args.append(theme)
+    if shot == "unknown":
+        where.append("NULLIF(taken_at,0) IS NULL")
+    if year:
+        where.append("substr(month,1,4)=?")
+        args.append(year)
     if month:
         where.append("month=?")
         args.append(month)
@@ -400,8 +544,22 @@ def group_counts(field: str) -> list[dict]:
     return rows
 
 
+def group_years() -> list[dict]:
+    """年→月层级：先按年份聚合，年份内再列各月及张数。按时间倒序（新→旧）。"""
+    tree: dict[str, dict] = {}
+    for r in _rows("SELECT month, COUNT(*) AS c FROM photos "
+                   "WHERE month != '' GROUP BY month ORDER BY month DESC"):
+        y = (r["month"] or "")[:4]
+        node = tree.setdefault(y, {"year": y, "c": 0, "months": []})
+        node["c"] += r["c"]
+        node["months"].append({"key": r["month"], "c": r["c"]})
+    return list(tree.values())
+
+
 def stats() -> dict:
     total = _rows("SELECT COUNT(*) AS c, SUM(bytes) AS b FROM photos")[0]
     done = _rows("SELECT COUNT(*) AS c FROM photos WHERE status='done'")[0]["c"]
     err = _rows("SELECT COUNT(*) AS c FROM photos WHERE status='error'")[0]["c"]
-    return {"total": total["c"], "bytes": total["b"] or 0, "done": done, "errors": err}
+    unknown = _rows("SELECT COUNT(*) AS c FROM photos WHERE NULLIF(taken_at,0) IS NULL")[0]["c"]
+    return {"total": total["c"], "bytes": total["b"] or 0, "done": done, "errors": err,
+            "shot_unknown": unknown, "shot_known": total["c"] - unknown}

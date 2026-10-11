@@ -13,7 +13,7 @@ import json
 import re
 from typing import Any, Callable, Iterable
 
-from . import db, llm
+from . import classifier, db, llm
 from .config import THEMES
 
 # ---------------------------------------------------------------- 基础词表
@@ -49,7 +49,8 @@ THEME_WORDS: dict[str, list[str]] = {
                "水族", "松鼠", "刺猬", "蜜蜂", "蝴蝶", "恐龙"],
     "night": ["夜景", "夜晚", "夜里", "晚上", "夜色", "霓虹", "灯光", "路灯", "星空",
               "星星", "月亮", "烟花", "焰火", "演唱会", "音乐节", "酒吧", "夜市", "烛光"],
-    "mono": ["黑白", "单色", "黑白照片", "灰度"],
+    # mono（黑白）已从互斥主题词表移出：它是与内容正交的风格轴，由 _look_conds 的
+    # mono_style 条件负责，不再把“黑白人像”强行归成 theme=mono。
     "screenshot": ["截图", "屏幕", "截屏", "长截图", "文档", "文字", "资料", "课件",
                    "ppt", "幻灯片", "表格", "二维码", "发票", "收据", "合同", "证书",
                    "账单", "订单", "聊天记录", "备忘录", "网页", "代码", "界面", "游戏画面"],
@@ -265,7 +266,8 @@ def _exif(r: dict) -> dict:
 
 
 def _shot_ts(r: dict) -> float:
-    return float(r.get("taken_at") or r.get("mtime") or 0)
+    # 只认真实拍摄时间（EXIF）；taken_at=0 代表时间未知，不拿文件 mtime 凑。
+    return float(r.get("taken_at") or 0)
 
 
 # ---------------------------------------------------------------- 时间解析
@@ -466,7 +468,7 @@ def _time_cond(text: str) -> tuple[dict | None, str, str]:
         # 区间太多时先用一个大区间缩小候选（判定仍在 Python 里按真实区间做）
         use = spans if len(spans) <= 10 else [(spans[0][0], max(b for _a, b in spans))]
         for a, b in use:
-            frags.append("(COALESCE(NULLIF(taken_at,0), mtime) BETWEEN ? AND ?)")
+            frags.append("(NULLIF(taken_at,0) BETWEEN ? AND ?)")
             args += [a, b]
         sql = ("(" + " OR ".join(frags) + ")", args)
         return _cond("time", label, 3.0, test, hard=True, sql=sql), label, masked
@@ -474,7 +476,7 @@ def _time_cond(text: str) -> tuple[dict | None, str, str]:
     mset = ",".join(["?"] * len(months))
     args = [f"{m:02d}" for m in months]
     sql = (f"(substr(month, 6, 2) IN ({mset}) OR (COALESCE(month,'')='' AND "
-           f"strftime('%m', COALESCE(NULLIF(taken_at,0), mtime), 'localtime') IN ({mset})))",
+           f"NULLIF(taken_at,0) IS NOT NULL AND strftime('%m', taken_at, 'localtime') IN ({mset})))",
            args + args)
 
     def test2(r, mo=tuple(months)):
@@ -626,11 +628,16 @@ def _look_conds(text: str) -> tuple[list[dict], list[str]]:
             if lab not in [c["label"] for c in conds]:
                 conds.append(_cond("visual", lab, 1.4,
                                    (lambda k=key, lo=lo: lambda r: _feats(r).get(k, 0) >= lo)()))
-    if any(w in text for w in ("黑白", "单色")):
+    if any(w in text for w in ("黑白", "单色", "灰度", "没有颜色", "去色")):
         words += [w for w in ("黑白", "单色") if w in text]
-        conds.append(_cond("visual", "色彩：黑白灰（低饱和）", 1.8,
-                           lambda r: _feats(r).get("gray_ratio", 0) > 0.5
-                           or _feats(r).get("sat_mean", 1) < 0.12))
+        # 优先走风格轴 mono_style（本地特征免费回填）；特征补位保证未回填时也能用。
+        # grade 用 mono_score 拉序：越黑白越前，不影响 match 分母。
+        conds.append(_cond(
+            "visual", "风格：黑白/单色", 1.8,
+            lambda r: int(r.get("mono_style") or 0) == 1
+            or _feats(r).get("gray_ratio", 0) > 0.5
+            or _feats(r).get("sat_mean", 1) < 0.12,
+            grade=lambda r: 0.3 * classifier.mono_score(_feats(r))))
     size_big = re.search(r"(文件|体积|图片|照片)\s*(很|比较|挺|太|蛮|超|多)?\s*大", text)
     if size_big or any(w in text for w in ("大图", "占地方")):
         words.append(size_big.group(0) if size_big else "大图")
@@ -721,10 +728,8 @@ def parse(text: str) -> dict:
         consumed += [w for w in ("周末", "双休", "周日", "星期天", "礼拜天", "周六", "星期六",
                                   "工作日", "上班时间", "平日里") if w in text]
 
-    mono = any(w in masked for w in ("黑白", "单色"))
-    if mono and not theme_conds:
-        conds.append(_cond("theme", "主题：黑白影像", 2.6,
-                           lambda r: r.get("theme") == "mono"))
+    # 黑白不再当互斥主题：过去这里在无主题命中时补一条 theme=="mono"，
+    # mono 移出主题池后那条永不命中，交给 _look_conds 的 mono_style 风格轴。
     look, look_words = _look_conds(masked)
     meta, meta_words = _meta_conds(masked)
     conds += look + meta
@@ -790,7 +795,7 @@ def _range_cond(spans: list[tuple[float, float]], label: str) -> dict | None:
     use = spans if len(spans) <= 10 else [(spans[0][0], max(b for _a, b in spans))]
     frags, args = [], []
     for a, b in use:
-        frags.append("(COALESCE(NULLIF(taken_at,0), mtime) BETWEEN ? AND ?)")
+        frags.append("(NULLIF(taken_at,0) BETWEEN ? AND ?)")
         args += [a, b]
     return _cond("time", "时间：" + label, 3.0, test, hard=True,
                  sql=("(" + " OR ".join(frags) + ")", args))

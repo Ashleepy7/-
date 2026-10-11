@@ -189,7 +189,6 @@ def analyze(path: str | Path) -> dict:
         full_w, full_h = img.size
         img = ImageOps.exif_transpose(img)
 
-    mtime = p.stat().st_mtime
     feats = _feats(img)
     feats.update({
         "full_w": full_w, "full_h": full_h,
@@ -200,10 +199,13 @@ def analyze(path: str | Path) -> dict:
     })
     if full_w * full_h < MIN_PIXELS:
         raise ValueError("图片尺寸过小")
+    # 拍摄时间只认真实 EXIF（DateTimeOriginal / DateTime）；读不到就记为 0（时间未知），
+    # 不再拿文件 mtime（导入/复制时间）冒充拍摄时间。
+    shot = _taken_timestamp(exif, 0.0)
     return {
         "width": full_w, "height": full_h,
-        "taken_at": _taken_timestamp(exif, mtime),
-        "month": time.strftime("%Y-%m", time.localtime(_taken_timestamp(exif, mtime))),
+        "taken_at": shot,
+        "month": time.strftime("%Y-%m", time.localtime(shot)) if shot else "",
         "exif": exif, "feats": feats,
     }
 

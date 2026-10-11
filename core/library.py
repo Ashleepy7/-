@@ -146,6 +146,7 @@ def _worker(roots: list[str] | None, recursive: bool, reclassify: bool,
                 data = features.analyze(row["path"])
                 theme, conf, scores, reasons = classifier.classify(data["feats"])
                 rule_theme = theme
+                mono_style = 1 if classifier.is_mono(data["feats"]) else 0
                 if row.get("manual") and row.get("theme"):
                     theme = row["theme"]      # 保留人工设定的主题
                 elif row.get("ai_theme"):
@@ -156,7 +157,7 @@ def _worker(roots: list[str] | None, recursive: bool, reclassify: bool,
                     "exif": data["exif"], "feats": data["feats"],
                     "theme": theme, "conf": conf, "scores": scores,
                     "reasons": reasons, "status": "done",
-                    "rule_theme": rule_theme,
+                    "rule_theme": rule_theme, "mono_style": mono_style,
                 })
             except Exception as exc:  # 单张损坏/格式异常不中断整体任务
                 _set(errors=JOB["errors"] + 1)
@@ -206,6 +207,18 @@ def _worker(roots: list[str] | None, recursive: bool, reclassify: bool,
              message=snapshot()["message"] + (
                  f"；已备份 {bk['file']}" if bk["ok"]
                  else f"；自动备份失败：{bk['error']}"))
+
+
+def backfill_mono_style(thr: float = 0.5) -> dict:
+    """全库免费回填黑白风格轴：只读已存的 feats、用本地规则重算 mono_style，
+    不解码图片也不调模型（“先不重标注”约束下唯一能把风格轴铺满的手段）。"""
+    items = db.all_photo_feats()
+    on = 0
+    for pid, feats in items:
+        v = 1 if classifier.is_mono(feats, thr) else 0
+        db.set_mono_style(pid, v)
+        on += v
+    return {"ok": True, "scanned": len(items), "mono": on}
 
 
 def start(paths: list[str] | None, recursive: bool = True, reclassify: bool = False,
