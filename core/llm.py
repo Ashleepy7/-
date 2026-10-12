@@ -28,10 +28,10 @@ CONF_PATH = DATA_DIR / "llm.json"
 
 DEFAULTS: dict = {
     "enabled": False,
-    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "base_url": "https://api.deepseek.com",
     "api_key": "",
-    "text_model": "qwen-plus",
-    "vl_model": "qwen-vl-plus",
+    "text_model": "deepseek-flash",
+    "vl_model": "deepseek-flash",
     "timeout": 180,         # 单次请求秒数：本地模型跑 CPU/显存小模型很慢，要给足
     "workers": 4,           # 批量标注并发数，太高会被限流
     "max_px": 1024,         # 送进模型的图先压到该边长以内，省 token

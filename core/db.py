@@ -68,23 +68,35 @@ def _conn() -> sqlite3.Connection:
     ensure_dirs()
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
+    # WAL：读写不再互斥——后台批量写（导入 / AI 重标注）时，前台读图不被挡在写锁外，
+    # 从根上治历史上的 "database is locked"（timeout=15 只是让读干等，WAL 才是真并行读）。
+    # journal_mode 会持久写进库头，重复设置幂等无害；synchronous=NORMAL 是每连接才生效、
+    # 不持久，随 WAL 一起放开写吞吐。busy_timeout 仍由 connect(timeout=15) 负责，
+    # 写串行仍靠全局 _LOCK——WAL 只让读不堵，不代表能并发写，两者都保持不变。
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
 
 def theme_src(row: dict) -> str:
     """这张照片当前显示的 theme 是谁定的：manual（人工）/ ai（模型）/ rule（本地规则）。
 
-    只有返回 rule 时 conf 才是这个主题的自信度：模型标注会把 theme 覆盖成 ai_theme，
-    而 conf 一直是规则分类器留下的分数（见 library.reanalyze）。“恢复自动识别”
-    会把 theme 写回 rule_theme，那时该主题确实是规则算出来的，百分比重新有意义。
-    界面据此决定该不该显示置信度百分比。
+    界面只在返回 rule 时显示置信度百分比，而 conf 永远是规则分类器留下的分数（见
+    library.reanalyze）。要让这个百分比“真实有效”，前提是它衡量的正是当前显示的主题：
+      · 显示主题就是规则算的（无 ai_theme）→ rule，百分比有效；
+      · 模型判的、且规则也投了同一个主题（撞车）→ 借规则的分佐证，仍归 rule，有效；
+      · 模型判的、但规则和它不一致 → 那个分数是“别的主题”的，配当前主题是张冠李戴，
+        归 ai、藏起百分比。
+    人工设定的主题与规则分数无关，一律归 manual，不显示百分比。
     """
     if row.get("manual"):
         return "manual"
     theme = (row.get("theme") or "").strip()
     ai = (row.get("ai_theme") or "").strip()
     rule = (row.get("rule_theme") or "").strip()
-    return "ai" if (ai and theme == ai and theme != rule) else "rule"
+    if ai and theme == ai:
+        return "rule" if (rule and theme == rule) else "ai"
+    return "rule"
 
 
 def init_db() -> None:
@@ -122,6 +134,12 @@ def backup() -> dict:
     走 sqlite 连接级的 backup API，不用 shutil.copy —— 后者可能拷到写到一半的库，
     那种备份打不开，等于没备份。任何失败都只返回 dict 绝不抛：备份不能拖垮启动。
     只备份、不做自动还原：手动拿这份 db 文件盖回 album.db 就是还原。
+
+    WAL 注意：开启 WAL 后 data/ 下会多出 album.db-wal、album.db-shm 两个附属文件，
+    未落盘的写可能还在 -wal 里。备份走的是 sqlite backup API，会把 WAL 一并收敛进
+    单个 dst 文件，副本自包含、能独立打开。手动还原时务必：先停服务（干净关闭会
+    checkpoint 并把 -wal 合回主库、删掉附属文件），或盖回主库后一并删掉旧的
+    album.db-wal / album.db-shm——只 Copy-Item 覆盖主库却残留旧 -wal，会让旧数据“复活”。
     """
     dst = BACKUP_DIR / f"album-{time.strftime('%Y%m%d-%H%M%S')}.db"
     try:

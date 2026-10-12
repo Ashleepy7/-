@@ -1274,8 +1274,14 @@ def _candidate_sql(conds: list[dict]) -> tuple[str, list[Any]]:
     return " AND ".join(where), args
 
 
-def _score_rows(rows: list[dict], usable: list[dict], denom: float) -> list[dict]:
-    """逐张判定：硬条件不满足的直接跳过，其余按命中权重算匹配度。"""
+def _score_rows(rows: list[dict], usable: list[dict],
+                score_conds: list[dict], denom: float) -> list[dict]:
+    """逐张判定：usable 决定能否入围（含未放宽的硬门禁）；score_conds 决定符合度打分。
+
+    主键 _match 是“对用户原始请求（未手动关闭的条件）的满足完整度”：被自动放宽掉的
+    条件照样算进这份完整度——命中就加分，因此“同时满足时间+主体”必然高于“只满足主体”，
+    不再因放宽把分母撑大而把满足者稀释、与半满足者拉不开差距（denom 恒为打分集合权重和）。
+    """
     scored: list[dict] = []
     # 低权重软条件不得单独把照片送进结果：当整句话一个硬条件都没有、且可用条件 ≥2 时，
     # 一张照片至少要被 2 个条件同时命中才入围。因为此时没有任何门禁在挡，
@@ -1285,20 +1291,22 @@ def _score_rows(rows: list[dict], usable: list[dict], denom: float) -> list[dict
     # 主题人像一个软条件）len(usable)==1 不触发，不会误伤“把我的人像都给我”。
     soft_only_gate = (not any(c["hard"] for c in usable)) and len(usable) >= 2
     for r in rows:
-        hits = [c for c in usable if _safe(c["test"], r)]
+        hits = [c for c in usable if _safe(c["test"], r)]          # 入围判定用未放宽的条件
         if not hits:
             continue
         if soft_only_gate and len(hits) < 2:
             continue                     # 纯靠一个宽泛软条件命中的，不收
         if any(c["hard"] and c not in hits for c in usable):
-            continue                     # 硬条件不满足的不展示
-        got = sum(c["w"] for c in hits)
+            continue                     # 未放宽的硬条件不满足的不展示
+        # 打分：对用户原话命中了多少（含被放宽掉、但照片确实满足的条件）
+        matched = [c for c in score_conds if _safe(c["test"], r)]
+        got = sum(c["w"] for c in matched)
         item = dict(r)
-        item["_hit"] = [c["label"] for c in hits]
-        item["_miss"] = [c["label"] for c in usable if c not in hits]
+        item["_hit"] = [c["label"] for c in matched]
+        item["_miss"] = [c["label"] for c in score_conds if c not in matched]
         item["_match"] = min(100, round(100 * got / denom))
-        # 同一个命中集里用 grade 拉开差距（越黑白/越蓝越前），不靠时间戳抓阅。
-        boost = sum((c["grade"](r) or 0) for c in hits if c.get("grade"))
+        # 次级 tie-breaker：同一完整度里用命中权重+视觉 grade+人工 拉开，绝不越过 _match。
+        boost = sum((c["grade"](r) or 0) for c in matched if c.get("grade"))
         item["_order"] = got + boost + (0.5 if r.get("manual") else 0.4)
         scored.append(item)
     return scored
@@ -1371,7 +1379,10 @@ def search(text: str = "", limit: int = 80, ignore: Iterable[str] = (),
     rows: list[dict] = []
     usable: list[dict] = []
     scored: list[dict] = []
-    denom = 1.0
+    # 打分集合 = 用户未手动关闭的原始条件（含可能被自动放宽掉的）。放宽只决定“能不能入围”，
+    # 不参与压低完整度分母：denom 恒为该集合权重和，命中全部=100%、只命中一半≈50%，拉得开差距。
+    score_conds = [c for c in parsed["conds"] if c["cid"] not in manual_off]
+    denom = sum(c["w"] for c in score_conds) or 1.0
     relaxed: list[str] = []
     # 放宽到「结果够看」为止：够 MIN_RELAX_RESULTS 张才停，否则只要还有可放宽的
     # 硬条件就接着放宽下一条（hard_cids 只含可松条件，内容/主题硬门禁不在其中）。
@@ -1386,15 +1397,18 @@ def search(text: str = "", limit: int = 80, ignore: Iterable[str] = (),
         where, args = _candidate_sql(parsed["conds"])
         rows = db.search_rows(where, args, cap=SCAN_CAP)
         relaxed = [c["label"] for c in parsed["conds"] if c["cid"] in skip]
-        # 自动放宽过硬条件时，分母仍包含被放宽的条件，不让结果看起来像“100% 符合”；
-        # 但用户手动关掉的条件不计入分母（他本来就不要求这个）。
-        wsum = sum(c["w"] for c in usable) or 1.0
-        w_all = sum(c["w"] for c in parsed["conds"] if c["cid"] not in manual_off) or wsum
-        denom = w_all if relaxed else wsum
-        scored = _score_rows(rows, usable, denom)
+        # 入围用 usable（未放宽条件）判定，完整度打分用 score_conds（含被放宽掉、但确实满足的）；
+        # denom 固定为原始请求权重，被放宽的条件不再进分母压低满足者的分数。
+        scored = _score_rows(rows, usable, score_conds, denom)
         # 够看（≥MIN_RELAX_RESULTS）或可放宽的硬条件已经全部放完，才收尾；
         # 否则继续放宽下一条——修的是「只 1 张就停」把还能救的结果卡在 1~2 张。
         if len(scored) >= MIN_RELAX_RESULTS or k == len(hard_cids):
+            break
+        # 护栏：已经拿到「完全符合当前生效条件」的结果，而下一条放宽会把唯一还生效的
+        # 条件也丢掉（usable 将为空、精确命中被后面的 `if not usable` 清零）——就保留这批
+        # 结果收尾，不再为凑够 MIN 张数把小时间窗（如"某年某月"仅 1~2 张）整个放没。
+        # 只有还留着别的条件可退让时才继续放宽找更多；单条件查询没有退路，别自废。
+        if scored and len(usable) <= 1:
             break
 
     # 用户点名坚持的条件不参与放宽，以它筛空了就把“怎么放弃”说一句
